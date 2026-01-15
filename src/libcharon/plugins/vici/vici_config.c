@@ -44,6 +44,9 @@
 #include "vici_builder.h"
 
 #include <daemon.h>
+#include <config/sa_validator.h>
+#include <processing/jobs/delete_ike_sa_job.h>
+#include <processing/jobs/delete_child_sa_job.h>
 #include <threading/rwlock.h>
 #include <threading/rwlock_condvar.h>
 #include <collections/array.h>
@@ -138,7 +141,176 @@ struct private_vici_config_t {
 	 */
 	vici_authority_t *authority;
 
+	/**
+	 * SA validator for smooth configuration reload
+	 */
+	sa_validator_t *validator;
+
+	/**
+	 * Listener for post-negotiation SA validation
+	 */
+	listener_t listener;
+
 };
+
+/**
+ * Get private_vici_config_t from listener pointer using container_of pattern
+ */
+static inline private_vici_config_t* listener_to_config(listener_t *listener)
+{
+	return (private_vici_config_t*)((char*)listener -
+			offsetof(private_vici_config_t, listener));
+}
+
+/**
+ * Listener callback for IKE_SA up/down events.
+ * Validates newly established IKE_SAs against current configuration.
+ */
+static bool ike_updown_cb(listener_t *listener, ike_sa_t *ike_sa, bool up)
+{
+	private_vici_config_t *this;
+	peer_cfg_t *peer_cfg;
+	ike_cfg_t *ike_cfg;
+	sa_validity_t result;
+
+	if (!up)
+	{
+		/* Only validate on "up" events */
+		return TRUE;
+	}
+
+	this = listener_to_config(listener);
+
+	if (!this->validator)
+	{
+		return TRUE;
+	}
+
+	this->lock->read_lock(this->lock);
+	peer_cfg = this->conns->get(this->conns, ike_sa->get_name(ike_sa));
+	if (peer_cfg)
+	{
+		peer_cfg->get_ref(peer_cfg);
+	}
+	this->lock->unlock(this->lock);
+
+	if (!peer_cfg)
+	{
+		/* Connection no longer exists in config - SA will be orphaned but
+		 * that's handled separately by config removal logic */
+		return TRUE;
+	}
+
+	ike_cfg = peer_cfg->get_ike_cfg(peer_cfg);
+	result = this->validator->validate_ike_sa(this->validator,
+											  ike_sa, peer_cfg, ike_cfg);
+	if (result == SA_VALID)
+	{
+		/* Also check auth class if IKE proposal is compatible */
+		result = this->validator->validate_auth(this->validator,
+												ike_sa, peer_cfg);
+	}
+	if (result != SA_VALID)
+	{
+		DBG1(DBG_CFG, "newly established IKE_SA %s[%u] incompatible with "
+			 "current config: %N, scheduling termination",
+			 ike_sa->get_name(ike_sa), ike_sa->get_unique_id(ike_sa),
+			 sa_validity_names, result);
+		/* Schedule termination - can't terminate directly in callback */
+		lib->processor->queue_job(lib->processor,
+			(job_t*)delete_ike_sa_job_create(ike_sa->get_id(ike_sa), TRUE));
+	}
+
+	peer_cfg->destroy(peer_cfg);
+	return TRUE;
+}
+
+/**
+ * Listener callback for CHILD_SA up/down events.
+ * Validates newly installed CHILD_SAs against current configuration.
+ */
+static bool child_updown_cb(listener_t *listener, ike_sa_t *ike_sa,
+							child_sa_t *child_sa, bool up)
+{
+	private_vici_config_t *this;
+	peer_cfg_t *peer_cfg;
+	child_cfg_t *child_cfg;
+	enumerator_t *enumerator;
+	sa_validity_t result;
+	char *child_name;
+
+	if (!up)
+	{
+		/* Only validate on "up" events */
+		return TRUE;
+	}
+
+	this = listener_to_config(listener);
+
+	if (!this->validator)
+	{
+		return TRUE;
+	}
+
+	child_name = child_sa->get_name(child_sa);
+
+	this->lock->read_lock(this->lock);
+	peer_cfg = this->conns->get(this->conns, ike_sa->get_name(ike_sa));
+	if (peer_cfg)
+	{
+		peer_cfg->get_ref(peer_cfg);
+	}
+	this->lock->unlock(this->lock);
+
+	if (!peer_cfg)
+	{
+		/* Connection no longer exists */
+		return TRUE;
+	}
+
+	/* Find matching child_cfg */
+	child_cfg = NULL;
+	enumerator = peer_cfg->create_child_cfg_enumerator(peer_cfg);
+	while (enumerator->enumerate(enumerator, &child_cfg))
+	{
+		if (streq(child_cfg->get_name(child_cfg), child_name))
+		{
+			child_cfg->get_ref(child_cfg);
+			break;
+		}
+		child_cfg = NULL;
+	}
+	enumerator->destroy(enumerator);
+
+	if (!child_cfg)
+	{
+		DBG1(DBG_CFG, "newly installed CHILD_SA %s[%u] has no matching config, "
+			 "scheduling termination",
+			 child_name, child_sa->get_unique_id(child_sa));
+		lib->processor->queue_job(lib->processor,
+			(job_t*)delete_child_sa_job_create_id(
+				child_sa->get_unique_id(child_sa)));
+		peer_cfg->destroy(peer_cfg);
+		return TRUE;
+	}
+
+	result = this->validator->validate_child_sa(this->validator,
+												child_sa, child_cfg);
+	if (result != SA_VALID)
+	{
+		DBG1(DBG_CFG, "newly installed CHILD_SA %s[%u] incompatible with "
+			 "current config: %N, scheduling termination",
+			 child_name, child_sa->get_unique_id(child_sa),
+			 sa_validity_names, result);
+		lib->processor->queue_job(lib->processor,
+			(job_t*)delete_child_sa_job_create_id(
+				child_sa->get_unique_id(child_sa)));
+	}
+
+	child_cfg->destroy(child_cfg);
+	peer_cfg->destroy(peer_cfg);
+	return TRUE;
+}
 
 CALLBACK(peer_filter, bool,
 	void *data, enumerator_t *orig, va_list args)
@@ -265,6 +437,10 @@ static bool parse_rules(parse_rule_t *rules, int count, char *name,
 typedef struct {
 	private_vici_config_t *this;
 	vici_message_t *reply;
+	/** If TRUE, store peer_cfg instead of merging (for validate-conn) */
+	bool validate_only;
+	/** Output: stores built peer_cfg when validate_only is TRUE */
+	peer_cfg_t *peer_cfg_out;
 } request_data_t;
 
 /**
@@ -2733,6 +2909,529 @@ static void replace_children(private_vici_config_t *this,
 }
 
 /**
+ * Rate limiter state for smooth SA termination
+ */
+typedef struct {
+	int total_sas;
+	int remaining_sas;
+	time_t deadline;
+	int min_delay_ms;
+	int max_delay_ms;
+} rate_limiter_t;
+
+/**
+ * Calculate delay for next termination based on rate limiter state
+ */
+static int calculate_termination_delay(rate_limiter_t *limiter)
+{
+	time_t now, time_remaining;
+	int ideal_delay_ms;
+
+	now = time_monotonic(NULL);
+	time_remaining = limiter->deadline - now;
+
+	if (time_remaining <= 0 || limiter->remaining_sas <= 0)
+	{
+		return limiter->min_delay_ms;
+	}
+
+	/* Calculate ideal delay to spread load evenly */
+	ideal_delay_ms = (time_remaining * 1000) / limiter->remaining_sas;
+
+	/* Clamp to configured bounds */
+	if (ideal_delay_ms < limiter->min_delay_ms)
+	{
+		return limiter->min_delay_ms;
+	}
+	if (ideal_delay_ms > limiter->max_delay_ms)
+	{
+		return limiter->max_delay_ms;
+	}
+	return ideal_delay_ms;
+}
+
+/**
+ * Find a child_cfg in peer_cfg by name
+ */
+static child_cfg_t *find_child_cfg_by_name(peer_cfg_t *peer_cfg, char *name)
+{
+	enumerator_t *enumerator;
+	child_cfg_t *child_cfg, *found = NULL;
+
+	enumerator = peer_cfg->create_child_cfg_enumerator(peer_cfg);
+	while (enumerator->enumerate(enumerator, &child_cfg))
+	{
+		if (streq(child_cfg->get_name(child_cfg), name))
+		{
+			found = child_cfg->get_ref(child_cfg);
+			break;
+		}
+	}
+	enumerator->destroy(enumerator);
+
+	return found;
+}
+
+/**
+ * Terminate all SAs belonging to a removed connection.
+ * Called when unload-conn removes a connection from config.
+ *
+ * Note: The lock must be unlocked when calling this.
+ */
+static void terminate_orphan_sas(private_vici_config_t *this,
+								 const char *conn_name)
+{
+	enumerator_t *ike_enum, *child_enum;
+	ike_sa_t *ike_sa;
+	child_sa_t *child_sa;
+	reload_policy_t *policy;
+	rate_limiter_t limiter;
+	array_t *child_ids = NULL, *ike_ids = NULL;
+	uint32_t child_id, ike_id;
+	int delay_ms;
+
+	if (!this->validator)
+	{
+		return;
+	}
+
+	policy = this->validator->get_policy(this->validator);
+
+	/* Enumerate all SAs for this connection */
+	ike_enum = charon->controller->create_ike_sa_enumerator(
+												charon->controller, TRUE);
+	while (ike_enum->enumerate(ike_enum, &ike_sa))
+	{
+		if (!streq(ike_sa->get_name(ike_sa), conn_name))
+		{
+			continue;
+		}
+
+		/* Collect all CHILD_SAs first */
+		child_enum = ike_sa->create_child_sa_enumerator(ike_sa);
+		while (child_enum->enumerate(child_enum, &child_sa))
+		{
+			child_id = child_sa->get_unique_id(child_sa);
+			array_insert_create_value(&child_ids, sizeof(child_id),
+									  ARRAY_TAIL, &child_id);
+		}
+		child_enum->destroy(child_enum);
+
+		/* Collect IKE_SA */
+		ike_id = ike_sa->get_unique_id(ike_sa);
+		array_insert_create_value(&ike_ids, sizeof(ike_id),
+								  ARRAY_TAIL, &ike_id);
+	}
+	ike_enum->destroy(ike_enum);
+
+	/* Schedule rate-limited terminations */
+	if (array_count(child_ids) || array_count(ike_ids))
+	{
+		limiter.total_sas = array_count(child_ids) + array_count(ike_ids);
+		limiter.remaining_sas = limiter.total_sas;
+		limiter.deadline = time_monotonic(NULL) + policy->max_duration;
+		limiter.min_delay_ms = policy->min_delay;
+		limiter.max_delay_ms = policy->max_delay;
+
+		DBG1(DBG_CFG, "scheduling termination of %d orphan SA(s) for "
+			 "removed connection '%s'", limiter.total_sas, conn_name);
+
+		/* Terminate CHILD_SAs first */
+		while (array_remove(child_ids, ARRAY_HEAD, &child_id))
+		{
+			delay_ms = calculate_termination_delay(&limiter);
+			DBG2(DBG_CFG, "scheduling orphan CHILD_SA #%u termination (delay=%dms)",
+				 child_id, delay_ms);
+			lib->scheduler->schedule_job_ms(lib->scheduler,
+				(job_t*)delete_child_sa_job_create_id(child_id), delay_ms);
+			limiter.remaining_sas--;
+		}
+
+		/* Then terminate IKE_SAs */
+		while (array_remove(ike_ids, ARRAY_HEAD, &ike_id))
+		{
+			ike_sa_t *ike_sa_ref;
+			ike_sa_id_t *id;
+
+			delay_ms = calculate_termination_delay(&limiter);
+			DBG2(DBG_CFG, "scheduling orphan IKE_SA #%u termination (delay=%dms)",
+				 ike_id, delay_ms);
+			/*
+			 * For IKE_SA termination, we need the ike_sa_id. We check out the SA
+			 * briefly to get its ID, then schedule the delete job.
+			 */
+			ike_sa_ref = charon->ike_sa_manager->checkout_by_id(
+									charon->ike_sa_manager, ike_id);
+			if (ike_sa_ref)
+			{
+				id = ike_sa_ref->get_id(ike_sa_ref);
+				lib->scheduler->schedule_job_ms(lib->scheduler,
+					(job_t*)delete_ike_sa_job_create(id, TRUE), delay_ms);
+				charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa_ref);
+			}
+			limiter.remaining_sas--;
+		}
+	}
+
+	array_destroy(child_ids);
+	array_destroy(ike_ids);
+}
+
+/**
+ * Validate running SAs against new configuration and terminate incompatible ones.
+ * Uses adaptive rate limiting to spread terminations smoothly over time.
+ *
+ * Note: The lock must be unlocked when calling this.
+ */
+static void validate_and_terminate_incompatible_sas(private_vici_config_t *this,
+													peer_cfg_t *peer_cfg)
+{
+	enumerator_t *ike_enum, *child_enum;
+	ike_sa_t *ike_sa;
+	child_sa_t *child_sa;
+	child_cfg_t *child_cfg;
+	ike_cfg_t *ike_cfg;
+	reload_policy_t *policy;
+	rate_limiter_t limiter;
+	array_t *child_ids = NULL, *ike_ids = NULL;
+	char *peer_name;
+	uint32_t child_id, ike_id;
+	sa_validity_t result;
+	ike_sa_state_t ike_state;
+	child_sa_state_t child_state;
+	int delay_ms;
+
+	if (!this->validator)
+	{
+		return;
+	}
+
+	/* Reload policy settings in case strongswan.conf was changed */
+	this->validator->reload_policy(this->validator);
+
+	policy = this->validator->get_policy(this->validator);
+	peer_name = peer_cfg->get_name(peer_cfg);
+	ike_cfg = peer_cfg->get_ike_cfg(peer_cfg);
+
+	this->handling_actions = TRUE;
+	this->lock->unlock(this->lock);
+
+	DBG2(DBG_CFG, "validating running SAs for connection '%s'", peer_name);
+
+	/* Phase 1: Enumerate and collect incompatible SAs */
+	ike_enum = charon->controller->create_ike_sa_enumerator(
+											charon->controller, TRUE);
+	while (ike_enum->enumerate(ike_enum, &ike_sa))
+	{
+		if (!streq(ike_sa->get_name(ike_sa), peer_name))
+		{
+			continue;
+		}
+
+		/* Skip SAs in negotiation states (RFC 9242 IKE_INTERMEDIATE) */
+		ike_state = ike_sa->get_state(ike_sa);
+		if (ike_state == IKE_CONNECTING || ike_state == IKE_REKEYING)
+		{
+			DBG2(DBG_CFG, "  skipping IKE_SA %s[%u] - negotiation in progress",
+				 peer_name, ike_sa->get_unique_id(ike_sa));
+			continue;
+		}
+
+		/* Validate IKE_SA */
+		result = this->validator->validate_ike_sa(this->validator,
+												  ike_sa, peer_cfg, ike_cfg);
+		if (result == SA_VALID)
+		{
+			/* Also check auth class if IKE proposal is compatible */
+			result = this->validator->validate_auth(this->validator,
+													ike_sa, peer_cfg);
+		}
+		if (result != SA_VALID)
+		{
+			DBG1(DBG_CFG, "IKE_SA %s[%u] incompatible with new config: %N",
+				 peer_name, ike_sa->get_unique_id(ike_sa),
+				 sa_validity_names, result);
+			ike_id = ike_sa->get_unique_id(ike_sa);
+			array_insert_create_value(&ike_ids, sizeof(ike_id),
+									  ARRAY_TAIL, &ike_id);
+			continue;
+		}
+
+		/* Validate each CHILD_SA within this IKE_SA */
+		child_enum = ike_sa->create_child_sa_enumerator(ike_sa);
+		while (child_enum->enumerate(child_enum, &child_sa))
+		{
+			/* Skip CHILD_SAs in negotiation states */
+			child_state = child_sa->get_state(child_sa);
+			if (child_state != CHILD_INSTALLED && child_state != CHILD_REKEYED)
+			{
+				DBG2(DBG_CFG, "  skipping CHILD_SA %s[%u] - state %N",
+					 child_sa->get_name(child_sa),
+					 child_sa->get_unique_id(child_sa),
+					 child_sa_state_names, child_state);
+				continue;
+			}
+
+			/* Find matching child_cfg in new config */
+			child_cfg = find_child_cfg_by_name(peer_cfg,
+											   child_sa->get_name(child_sa));
+			if (!child_cfg)
+			{
+				DBG1(DBG_CFG, "CHILD_SA %s[%u] config removed",
+					 child_sa->get_name(child_sa),
+					 child_sa->get_unique_id(child_sa));
+				child_id = child_sa->get_unique_id(child_sa);
+				array_insert_create_value(&child_ids, sizeof(child_id),
+										  ARRAY_TAIL, &child_id);
+				continue;
+			}
+
+			/* Validate CHILD_SA */
+			result = this->validator->validate_child_sa(this->validator,
+														child_sa, child_cfg);
+			if (result != SA_VALID)
+			{
+				DBG1(DBG_CFG, "CHILD_SA %s[%u] incompatible: %N",
+					 child_sa->get_name(child_sa),
+					 child_sa->get_unique_id(child_sa),
+					 sa_validity_names, result);
+				child_id = child_sa->get_unique_id(child_sa);
+				array_insert_create_value(&child_ids, sizeof(child_id),
+										  ARRAY_TAIL, &child_id);
+			}
+			child_cfg->destroy(child_cfg);
+		}
+		child_enum->destroy(child_enum);
+	}
+	ike_enum->destroy(ike_enum);
+
+	/* Phase 2: Schedule terminations with rate limiting using scheduler */
+	limiter.total_sas = array_count(child_ids) + array_count(ike_ids);
+	limiter.remaining_sas = limiter.total_sas;
+	limiter.deadline = time_monotonic(NULL) + policy->max_duration;
+	limiter.min_delay_ms = policy->min_delay;
+	limiter.max_delay_ms = policy->max_delay;
+
+	if (limiter.total_sas > 0)
+	{
+		DBG1(DBG_CFG, "scheduling termination of %d incompatible SA(s) "
+			 "(max_duration=%us)", limiter.total_sas, policy->max_duration);
+	}
+
+	/* Schedule CHILD_SA terminations with increasing delays */
+	while (array_remove(child_ids, ARRAY_HEAD, &child_id))
+	{
+		delay_ms = calculate_termination_delay(&limiter);
+		DBG2(DBG_CFG, "scheduling CHILD_SA #%u termination (delay=%dms)",
+			 child_id, delay_ms);
+		lib->scheduler->schedule_job_ms(lib->scheduler,
+			(job_t*)delete_child_sa_job_create_id(child_id), delay_ms);
+		limiter.remaining_sas--;
+	}
+	array_destroy(child_ids);
+
+	/* Schedule IKE_SA terminations after CHILD_SAs */
+	while (array_remove(ike_ids, ARRAY_HEAD, &ike_id))
+	{
+		ike_sa_t *ike_sa_ref;
+		ike_sa_id_t *id;
+
+		delay_ms = calculate_termination_delay(&limiter);
+		DBG2(DBG_CFG, "scheduling IKE_SA #%u termination (delay=%dms)",
+			 ike_id, delay_ms);
+		/*
+		 * For IKE_SA termination, we need the ike_sa_id. We check out the SA
+		 * briefly to get its ID, then schedule the delete job.
+		 */
+		ike_sa_ref = charon->ike_sa_manager->checkout_by_id(
+								charon->ike_sa_manager, ike_id);
+		if (ike_sa_ref)
+		{
+			id = ike_sa_ref->get_id(ike_sa_ref);
+			lib->scheduler->schedule_job_ms(lib->scheduler,
+				(job_t*)delete_ike_sa_job_create(id, TRUE), delay_ms);
+			charon->ike_sa_manager->checkin(charon->ike_sa_manager, ike_sa_ref);
+		}
+		limiter.remaining_sas--;
+	}
+	array_destroy(ike_ids);
+
+	this->lock->write_lock(this->lock);
+	this->handling_actions = FALSE;
+}
+
+/**
+ * Extended request data for validate-conn command
+ */
+typedef struct {
+	/** Base request data */
+	request_data_t base;
+	/** Parsed peer_cfg (stored instead of merged) */
+	peer_cfg_t *peer_cfg;
+	/** Connection name */
+	char *conn_name;
+} validate_request_data_t;
+
+/**
+ * Collect SA validation results (read-only, no termination)
+ */
+typedef struct {
+	uint32_t unique_id;
+	char *name;
+	sa_validity_t reason;
+	bool is_ike;  /* TRUE for IKE_SA, FALSE for CHILD_SA */
+	char *details;  /* Detailed description of incompatibility (caller must free) */
+} validation_result_t;
+
+/**
+ * Validate running SAs against proposed config (dry-run, read-only).
+ * Returns arrays of preserved and incompatible SAs.
+ */
+static void validate_sas_dry_run(private_vici_config_t *this,
+								 peer_cfg_t *peer_cfg,
+								 array_t **preserved,
+								 array_t **incompatible)
+{
+	enumerator_t *ike_enum, *child_enum;
+	ike_sa_t *ike_sa;
+	child_sa_t *child_sa;
+	child_cfg_t *child_cfg;
+	ike_cfg_t *ike_cfg;
+	char *peer_name;
+	sa_validity_t result;
+	ike_sa_state_t ike_state;
+	child_sa_state_t child_state;
+	validation_result_t entry;
+
+	*preserved = array_create(sizeof(validation_result_t), 8);
+	*incompatible = array_create(sizeof(validation_result_t), 8);
+
+	if (!this->validator)
+	{
+		return;
+	}
+
+	/* Reload policy settings in case strongswan.conf was changed */
+	this->validator->reload_policy(this->validator);
+
+	peer_name = peer_cfg->get_name(peer_cfg);
+	ike_cfg = peer_cfg->get_ike_cfg(peer_cfg);
+
+	/* Enumerate SAs and validate (read-only) */
+	ike_enum = charon->controller->create_ike_sa_enumerator(
+											charon->controller, TRUE);
+	while (ike_enum->enumerate(ike_enum, &ike_sa))
+	{
+		if (!streq(ike_sa->get_name(ike_sa), peer_name))
+		{
+			continue;
+		}
+
+		/* Skip SAs in negotiation states */
+		ike_state = ike_sa->get_state(ike_sa);
+		if (ike_state == IKE_CONNECTING || ike_state == IKE_REKEYING)
+		{
+			continue;
+		}
+
+		/* Validate IKE_SA */
+		result = this->validator->validate_ike_sa(this->validator,
+												  ike_sa, peer_cfg, ike_cfg);
+		if (result == SA_VALID)
+		{
+			/* Also check auth class if IKE proposal is compatible */
+			result = this->validator->validate_auth(this->validator,
+													ike_sa, peer_cfg);
+		}
+
+		entry.unique_id = ike_sa->get_unique_id(ike_sa);
+		entry.name = strdup(peer_name);
+		entry.is_ike = TRUE;
+		entry.reason = result;
+		entry.details = NULL;
+
+		if (result != SA_VALID)
+		{
+			/* Get detailed proposal diff if it's a proposal mismatch */
+			if (result == SA_INCOMPATIBLE_IKE_PROPOSAL)
+			{
+				entry.details = this->validator->get_ike_proposal_details(
+										this->validator, ike_sa, ike_cfg);
+			}
+			array_insert(*incompatible, ARRAY_TAIL, &entry);
+			continue;
+		}
+
+		array_insert(*preserved, ARRAY_TAIL, &entry);
+
+		/* Validate each CHILD_SA within this IKE_SA */
+		child_enum = ike_sa->create_child_sa_enumerator(ike_sa);
+		while (child_enum->enumerate(child_enum, &child_sa))
+		{
+			/* Skip CHILD_SAs in negotiation states */
+			child_state = child_sa->get_state(child_sa);
+			if (child_state != CHILD_INSTALLED && child_state != CHILD_REKEYED)
+			{
+				continue;
+			}
+
+			entry.unique_id = child_sa->get_unique_id(child_sa);
+			entry.name = strdup(child_sa->get_name(child_sa));
+			entry.is_ike = FALSE;
+			entry.details = NULL;
+
+			/* Find matching child_cfg in new config */
+			child_cfg = find_child_cfg_by_name(peer_cfg,
+											   child_sa->get_name(child_sa));
+			if (!child_cfg)
+			{
+				entry.reason = SA_CONFIG_MISSING;
+				array_insert(*incompatible, ARRAY_TAIL, &entry);
+				continue;
+			}
+
+			/* Validate CHILD_SA */
+			result = this->validator->validate_child_sa(this->validator,
+														child_sa, child_cfg);
+			entry.reason = result;
+
+			if (result != SA_VALID)
+			{
+				/* Get detailed proposal diff if it's a proposal mismatch */
+				if (result == SA_INCOMPATIBLE_CHILD_PROPOSAL)
+				{
+					entry.details = this->validator->get_child_proposal_details(
+											this->validator, child_sa, child_cfg);
+				}
+				array_insert(*incompatible, ARRAY_TAIL, &entry);
+			}
+			else
+			{
+				array_insert(*preserved, ARRAY_TAIL, &entry);
+			}
+			child_cfg->destroy(child_cfg);
+		}
+		child_enum->destroy(child_enum);
+	}
+	ike_enum->destroy(ike_enum);
+}
+
+/**
+ * Free validation results array
+ */
+static void free_validation_results(array_t *results)
+{
+	validation_result_t entry;
+
+	while (array_remove(results, ARRAY_HEAD, &entry))
+	{
+		free(entry.name);
+		free(entry.details);
+	}
+	array_destroy(results);
+}
+
+/**
  * Merge/replace a peer config with existing configs
  */
 static void merge_config(private_vici_config_t *this, peer_cfg_t *peer_cfg)
@@ -2755,6 +3454,10 @@ static void merge_config(private_vici_config_t *this, peer_cfg_t *peer_cfg)
 		{
 			DBG1(DBG_CFG, "updated vici connection: %s",
 				 peer_cfg->get_name(peer_cfg));
+			/* Validate running SAs against new config before updating children.
+			 * This terminates SAs whose negotiated parameters are incompatible
+			 * with the new configuration (RFC 9242/9370 aware). */
+			validate_and_terminate_incompatible_sas(this, peer_cfg);
 			replace_children(this, peer_cfg, found);
 			peer_cfg->destroy(peer_cfg);
 		}
@@ -2764,6 +3467,10 @@ static void merge_config(private_vici_config_t *this, peer_cfg_t *peer_cfg)
 				 peer_cfg->get_name(peer_cfg));
 			this->conns->put(this->conns, peer_cfg->get_name(peer_cfg),
 							 peer_cfg);
+			/* Validate running SAs against new config before terminating.
+			 * This may terminate fewer SAs than handle_start_actions() would
+			 * if only some SAs are incompatible with the new config. */
+			validate_and_terminate_incompatible_sas(this, peer_cfg);
 			handle_start_actions(this, found, TRUE);
 			handle_start_actions(this, peer_cfg, FALSE);
 			found->destroy(found);
@@ -3010,7 +3717,15 @@ CALLBACK(config_sn, bool,
 
 	free_peer_data(&peer);
 
-	merge_config(request->this, peer_cfg);
+	if (request->validate_only)
+	{
+		/* Store peer_cfg for validation instead of merging */
+		request->peer_cfg_out = peer_cfg;
+	}
+	else
+	{
+		merge_config(request->this, peer_cfg);
+	}
 
 	return TRUE;
 }
@@ -3038,6 +3753,7 @@ CALLBACK(unload_conn, vici_message_t*,
 {
 	peer_cfg_t *cfg;
 	char *conn_name;
+	char *conn_name_copy = NULL;
 
 	conn_name = message->get_str(message, NULL, "name");
 	if (!conn_name)
@@ -3053,7 +3769,9 @@ CALLBACK(unload_conn, vici_message_t*,
 	cfg = this->conns->remove(this->conns, conn_name);
 	if (cfg)
 	{
-		DBG1(DBG_CFG, "removed vici connection: %s", cfg->get_name(cfg));
+		/* Copy connection name before destroying cfg */
+		conn_name_copy = strdup(cfg->get_name(cfg));
+		DBG1(DBG_CFG, "removed vici connection: %s", conn_name_copy);
 		handle_start_actions(this, cfg, TRUE);
 		cfg->destroy(cfg);
 	}
@@ -3064,6 +3782,14 @@ CALLBACK(unload_conn, vici_message_t*,
 	{
 		return create_reply("unload: connection '%s' not found", conn_name);
 	}
+
+	/* Terminate any orphan SAs for this removed connection */
+	if (conn_name_copy)
+	{
+		terminate_orphan_sas(this, conn_name_copy);
+		free(conn_name_copy);
+	}
+
 	return create_reply(NULL);
 }
 
@@ -3091,6 +3817,98 @@ CALLBACK(get_conns, vici_message_t*,
 	return builder->finalize(builder);
 }
 
+/**
+ * Validate connection configuration against running SAs (dry-run).
+ * Returns lists of SAs that would be preserved or terminated.
+ */
+CALLBACK(validate_conn, vici_message_t*,
+	private_vici_config_t *this, char *name, u_int id, vici_message_t *message)
+{
+	request_data_t request = {
+		.this = this,
+		.validate_only = TRUE,
+	};
+	vici_builder_t *builder;
+	array_t *preserved, *incompatible;
+	validation_result_t entry;
+	int preserved_count, incompatible_count;
+
+	if (!message->parse(message, NULL, config_sn, NULL, NULL, &request))
+	{
+		if (request.reply)
+		{
+			return request.reply;
+		}
+		return create_reply("parsing request failed");
+	}
+
+	if (!request.peer_cfg_out)
+	{
+		return create_reply("failed to build connection config");
+	}
+
+	/* Run dry-run validation */
+	validate_sas_dry_run(this, request.peer_cfg_out, &preserved, &incompatible);
+
+	/* Build response */
+	builder = vici_builder_create();
+	builder->add_kv(builder, "success", "yes");
+	builder->add_kv(builder, "connection", "%s",
+					request.peer_cfg_out->get_name(request.peer_cfg_out));
+
+	/* List preserved SAs */
+	builder->begin_section(builder, "preserved");
+	preserved_count = 0;
+	while (array_get(preserved, preserved_count, &entry))
+	{
+		char section_name[64];
+		snprintf(section_name, sizeof(section_name), "%s-%d",
+				 entry.is_ike ? "ike" : "child", preserved_count);
+		builder->begin_section(builder, section_name);
+		builder->add_kv(builder, "unique_id", "%u", entry.unique_id);
+		builder->add_kv(builder, "name", "%s", entry.name);
+		builder->add_kv(builder, "type", "%s", entry.is_ike ? "IKE_SA" : "CHILD_SA");
+		builder->end_section(builder);
+		preserved_count++;
+	}
+	builder->end_section(builder);
+
+	/* List incompatible SAs */
+	builder->begin_section(builder, "incompatible");
+	incompatible_count = 0;
+	while (array_get(incompatible, incompatible_count, &entry))
+	{
+		char section_name[64];
+		snprintf(section_name, sizeof(section_name), "%s-%d",
+				 entry.is_ike ? "ike" : "child", incompatible_count);
+		builder->begin_section(builder, section_name);
+		builder->add_kv(builder, "unique_id", "%u", entry.unique_id);
+		builder->add_kv(builder, "name", "%s", entry.name);
+		builder->add_kv(builder, "type", "%s", entry.is_ike ? "IKE_SA" : "CHILD_SA");
+		builder->add_kv(builder, "reason", "%N", sa_validity_names, entry.reason);
+		if (entry.details)
+		{
+			builder->add_kv(builder, "details", "%s", entry.details);
+		}
+		builder->end_section(builder);
+		incompatible_count++;
+	}
+	builder->end_section(builder);
+
+	/* Summary */
+	builder->begin_section(builder, "summary");
+	builder->add_kv(builder, "preserved", "%d", preserved_count);
+	builder->add_kv(builder, "incompatible", "%d", incompatible_count);
+	builder->end_section(builder);
+
+	/* Cleanup */
+	free_validation_results(preserved);
+	free_validation_results(incompatible);
+	request.peer_cfg_out->destroy(request.peer_cfg_out);
+
+	return builder->finalize(builder);
+}
+
 static void manage_command(private_vici_config_t *this,
 						   char *name, vici_command_cb_t cb, bool reg)
 {
@@ -3106,6 +3924,7 @@ static void manage_commands(private_vici_config_t *this, bool reg)
 	manage_command(this, "load-conn", load_conn, reg);
 	manage_command(this, "unload-conn", unload_conn, reg);
 	manage_command(this, "get-conns", get_conns, reg);
+	manage_command(this, "validate-conn", validate_conn, reg);
 }
 
 CALLBACK(destroy_conn, void,
@@ -3117,8 +3936,10 @@ CALLBACK(destroy_conn, void,
 METHOD(vici_config_t, destroy, void,
 	private_vici_config_t *this)
 {
+	charon->bus->remove_listener(charon->bus, &this->listener);
 	manage_commands(this, FALSE);
 	this->conns->destroy_function(this->conns, destroy_conn);
+	DESTROY_IF(this->validator);
 	this->condvar->destroy(this->condvar);
 	this->lock->destroy(this->lock);
 	free(this);
@@ -3148,9 +3969,15 @@ vici_config_t *vici_config_create(vici_dispatcher_t *dispatcher,
 		.condvar = rwlock_condvar_create(),
 		.authority = authority,
 		.cred = cred,
+		.validator = sa_validator_create(),
+		.listener = {
+			.ike_updown = ike_updown_cb,
+			.child_updown = child_updown_cb,
+		},
 	);
 
 	manage_commands(this, TRUE);
+	charon->bus->add_listener(charon->bus, &this->listener);
 
 	return &this->public;
 }

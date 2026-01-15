@@ -19,6 +19,7 @@ swanctl_SOURCES = \
 	commands/load_all.c \
 	commands/load_authorities.h  commands/load_authorities.c \
 	commands/load_conns.c commands/load_conns.h \
+	commands/validate_conns.c \
 	commands/load_creds.c commands/load_creds.h \
 	commands/load_pools.c commands/load_pools.h \
 	commands/log.c \
